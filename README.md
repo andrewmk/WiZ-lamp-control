@@ -8,11 +8,12 @@ speaks the same protocol the official app uses: plain JSON over
 
 ## Files
 
-| File           | What it is                                                    |
-|----------------|---------------------------------------------------------------|
-| `wiz.py`       | The client: a CLI **and** an importable Python library       |
-| `pair.py`      | Pair a bulb to Wi-Fi **without the app** (AP pairing mode)   |
-| `halloween.py` | Example app: green "lightning" flicker, uses `wiz.py` as lib |
+| File              | What it is                                                    |
+|-------------------|---------------------------------------------------------------|
+| `wiz.py`          | The client: a CLI **and** an importable Python library       |
+| `pair.py`         | Pair a bulb to Wi-Fi **without the app** (AP pairing mode)   |
+| `ap-udp-test.ps1` | Host-side (Windows) UDP control test for the AP window       |
+| `halloween.py`    | Example app: green "lightning" flicker, uses `wiz.py` as lib |
 
 ---
 
@@ -150,13 +151,16 @@ update rate, s), `--duration` (seconds; 0 = run until Ctrl+C).
 ## 4. Pairing a bulb (no app) — **WORK IN PROGRESS**
 
 > **Status (tested 2026-11-01):** not yet proven end-to-end. The bulb
-> entered AP mode fine, but the first `send` attempt failed: from this
-> WSL2 VM, the bulb's hotspot IP was **unreachable** (even a read-only
-> `getSystemConfig` to `192.168.4.1:38899` timed out while the Windows
-> host was connected to the `WiZConfig_*` AP). So the `setWifiConfig`
-> step was never actually exercised against a real bulb. See
-> "Where it stopped" and "Next steps" at the end of this section.
-> **The bulb is left unpaired until one of the recovery paths is done.**
+> entered AP mode fine and its AP IP is confirmed (**192.168.56.1**,
+> the gateway on the `WiZConfig_*` network; the host's Wi-Fi joins it
+> and gets `192.168.56.100` from the bulb's DHCP). Traffic from the
+> WSL2 VM reaches the AP (ping works), and — importantly — the bulb's
+> AP mode **does not answer UDP probes on any of 8 candidate ports
+> from either the VM or the Windows host directly** (no NAT involved).
+> So the WSL2-NAT hypothesis is ruled out: the AP-mode control server
+> is either on a port we haven't guessed, or it isn't listening for
+> plain UDP at all. Next: the full sweep in "Next steps". **The bulb
+> is left unpaired until one of the recovery paths is done.**
 
 The app's normal pairing hands Wi-Fi credentials to the bulb over
 **Bluetooth** — but WiZ also has a fully-UDP fallback: **AP pairing mode**
@@ -168,8 +172,9 @@ How AP mode works (from WiZ's own docs):
   purple** (RGB models) and broadcasts a Wi-Fi network named
   **`WiZConfig_xxxx`** (the suffix relates to the bulb's MAC).
 - Anything that connects to that network can reach the bulb at its
-  soft-AP address **192.168.4.1** (ESP default) and send it the home
-  credentials via UDP `setWifiConfig`.
+  soft-AP address and send it the home credentials via UDP
+  `setWifiConfig`. Observed on this bulb: network **192.168.56.0/24**,
+  bulb at **192.168.56.1** (the gateway clients see on that network).
 - On success the hotspot disappears and the bulb joins your network on
   its own. (WiZ's support docs: "this step seldom fails".)
 
@@ -179,10 +184,10 @@ How AP mode works (from WiZ's own docs):
    (3 clicks, 1–2 s apart). Bulb pulses blue (ready to pair).
    Wait up to a minute — if unpaired it drops to AP mode
    (**double purple pulse**, `WiZConfig_xxxx` appears in your Wi-Fi list).
-2. **Connect a Wi-Fi radio to `WiZConfig_xxxx`**: ideally a Linux laptop
-   (cleanest path). A Windows host also works *if* you then run the script
-   on the host itself — note the WSL2 VM did **not** reach the AP through
-   the host's NAT in testing (see "Where it stopped").
+2. **Connect a Wi-Fi radio to `WiZConfig_xxxx`**: a Linux laptop is
+   the cleanest path; the Windows host works too, and the WSL2 VM on
+   it reaches the AP fine as well (ICMP and outbound UDP both get
+   through — see "Where it stopped").
 3. **Send the credentials** (from the VM, or from the laptop):
    ```bash
    python3 pair.py send "MyHomeWifi" "MyPassword"
@@ -200,15 +205,29 @@ How AP mode works (from WiZ's own docs):
 ### `pair.py` reference
 
 ```bash
-python3 pair.py send <ssid> <password> [--ap-ip 192.168.4.1] [--raw-params '{...}']
+python3 pair.py send <ssid> <password> [--ap-ip auto|IP] [--port 38899] [--raw-params '{...}']
 python3 pair.py find [--seconds 10]
 python3 pair.py scan <CIDR|a.b.c.d-e|IP>
+python3 pair.py diag [--ap-ip auto|IP]
+python3 ap-sweep.py [--ip 192.168.56.1] [--no-mdns]
 ```
 
 - `send` — run while connected to the bulb's `WiZConfig_*` network.
-  Prints the bulb's MAC/model/firmware from the hotspot first, then tries
-  credential variants (`ssid`+`password`, `ssid`+`psk`, nested `wifi:{...}`)
-  until one is accepted.
+  `--ap-ip auto` (default) probes `192.168.56.1` then `192.168.4.1`;
+  `--port` overrides the UDP port (default 38899) if `ap-sweep.py`
+  finds the AP-mode server elsewhere. Prints the bulb's
+  MAC/model/firmware from the hotspot first, then tries credential
+  variants (`ssid`+`password`, `ssid`+`psk`, nested `wifi:{...}`) until
+  one is accepted.
+- `diag` — quick probe of 2 IPs × 8 candidate ports (~20 s); reports
+  any response. Superseded by `ap-sweep.py` for the deep dive.
+- `ap-sweep.py` — the deep dive: a full 1–65535 UDP sweep with 5
+  read-only probe payloads (~35 s). Any port that answers is reported
+  (replies are attributed by source port). No `setWifiConfig` is ever
+  sent, so it can't disturb the bulb's state. Runs on system
+  `python3` (no dependencies). The optional mDNS browse is **unproven**
+  (needs a venv with `zeroconf`); use `--no-mdns` — the sweep is the
+  main event.
 - `find` — UDP broadcast of `getSystemConfig` on this machine's LAN.
 - `scan` — parallel unicast `getSystemConfig` sweep of an address range
   (this is what finds the bulb's new IP from WSL2).
@@ -222,37 +241,52 @@ not to be implemented on a particular firmware.
 | Step | Result |
 |------|--------|
 | Bulb → AP mode (double purple pulse, `WiZConfig_*` SSID) | ✅ worked |
-| Windows host joined the `WiZConfig_*` AP | ✅ worked |
-| WSL2 VM → bulb hotspot IP `192.168.4.1:38899` | ❌ timeout (read-only probe) |
+| Windows host joined the `WiZConfig_*` AP | ✅ worked (got `192.168.56.100`, gateway `192.168.56.1`) |
+| Bulb's AP IP identified | ✅ `192.168.56.1` |
+| WSL2 VM → `192.168.56.1` (ICMP ping) | ✅ works — WSL2 NAT *does* forward the VM's traffic to the AP |
+| `pair.py diag` (VM): 2 IPs × 8 candidate ports | ❌ no response anywhere |
+| `ap-udp-test.ps1` (host, **direct L2, no NAT**): 8 candidate ports | ❌ no response on any port |
 | `pair.py send` (setWifiConfig) | ⬜ never reached a live bulb |
+
+**Key deduction:** the host sits directly on the bulb's Wi-Fi (same L2
+segment, gateway = the bulb). It gets *no* UDP replies either, so the
+WSL2-NAT hypothesis is **ruled out**. The AP-mode firmware simply does
+not answer our probes on the known IoT ports.
 
 Open questions, in order of suspicion:
 
-1. **Can the Windows host itself reach `192.168.4.1`?** If yes, the
-   blocker is the WSL2 NAT / Windows firewall, not the protocol.
-2. **Is `192.168.4.1` actually the bulb's AP IP?** It's the ESP soft-AP
-   default but unverified — check `ipconfig` on the host while connected
-   to `WiZConfig_*` (the host gets `192.168.4.x`, the bulb is likely `.1`).
-3. **`setWifiConfig` param names** — undocumented; `pair.py send` tries
-   4 variants. Untested against a live bulb.
+1. **AP mode listens on a port we haven't guessed** → `ap-sweep.py`
+   settles it in one ~50 s run (full 1–65535 sweep + mDNS).
+2. **The AP-mode UDP server only answers after a handshake** our
+   probes don't match (e.g. a `registration` exchange first — the
+   sweep includes a registration probe, but a full handshake may be
+   needed).
+3. **AP mode has no UDP server at all** and the credential hand-off
+   happens over another channel (e.g. the phone still uses Bluetooth
+   even while sitting on the AP) → in that case a pure-script pair
+   needs the BLE side, or one app-assisted pairing.
 
-### Next steps to resume (cheapest first)
+### Next steps to resume (one AP window, one command)
 
-1. **From the Windows host** (PowerShell, while on the `WiZConfig_*` AP):
-   ```powershell
-   Test-NetConnection 192.168.4.1 -Port 38899
-   ipconfig   # confirm the host's address on that network
-   ```
-   - If reachable from the host: the WSL2 VM is the problem → use WSL2
-     **mirrored networking** (Windows 11: ` networkingMode=mirrored ` in
-     `%UserProfile%\.wslconfig`), or add a Windows Firewall rule allowing
-     UDP from the WSL vNIC, or just run `pair.py send` **on the host**
-     (needs Python installed there).
-2. **Cleanest option:** run `pair.py send` from a **Linux laptop**
-   connected to the `WiZConfig_*` AP — no NAT in the path at all.
-3. Once `send` is accepted, the bulb leaves the AP: reconnect to home
-   Wi-Fi and run `pair.py scan 192.168.0.0/24` (from the VM) to get its
-   new DHCP address.
+1. **Bulb in AP mode** (double purple pulse), **host on `WiZConfig_*`**.
+2. **VM:** `python3 ap-sweep.py --no-mdns` — ~35 s: full 1–65535 UDP
+   sweep on `192.168.56.1` with 5 read-only probes per port
+   (getSystemConfig, getPilot, ping, registration, malformed frame).
+   No dependencies; system `python3` is fine.
+3. **Interpret:**
+   - A port answers → in the same window run
+     `python3 pair.py send "<home-ssid>" "<home-password>" --ap-ip 192.168.56.1 --port <port>`
+     (the bulb stays in AP mode until pairing succeeds, so you have the
+     full minute).
+   - mDNS announces a service → its type/ports go straight into
+     `--port`.
+   - Nothing answers at all → hypothesis 2/3 above: the hand-off isn't
+     a plain UDP server. Then either capture the official app's traffic
+     on a phone while it pairs on the AP, or do the one-time app
+     pairing and move on — everything after that is `wiz.py`.
+4. Once `send` is accepted, the bulb leaves the AP: reconnect to home
+   Wi-Fi and run `pair.py scan` over the home range (from the VM) to get
+   its new DHCP address.
 
 ### Recovering the bulb (it's currently unpaired)
 

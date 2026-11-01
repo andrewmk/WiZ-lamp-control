@@ -14,10 +14,16 @@ Uses the bulb's AP pairing mode (WiZ calls it "manual pairing"):
      Windows host (this WSL2 VM reaches it through the host's NAT
      when the host is connected to the AP).
   3. Run:  pair.py send "<home-ssid>" "<home-password>"
-     — sends setWifiConfig over UDP 38899 to the bulb's hotspot IP
-     (192.168.4.1, the ESP soft-AP default). The exact param names are
-     undocumented, so several variants are tried in order; the bulb
-     stays in AP mode until pairing succeeds, so you can just re-run.
+     — sends setWifiConfig over UDP to the bulb's hotspot IP
+     (default port 38899, override with --port). --ap-ip auto
+     (default) probes 192.168.56.1 (observed WiZ AP IP — the
+     client's gateway on that network) then 192.168.4.1 (ESP
+     soft-AP default). The exact param names are undocumented, so
+     several variants are tried in order; the bulb stays in AP mode
+     until pairing succeeds, so you can just re-run.
+     If nothing gets a reply, run ap-sweep.py (full 1-65535 UDP
+     sweep + mDNS browse) to find out what the AP is actually
+     listening on.
   4. The bulb leaves the hotspot and joins your network. Reconnect the
      machine to home Wi-Fi, then find the bulb's new DHCP address:
        pair.py find                    (from a machine on the home LAN)
@@ -41,25 +47,48 @@ from concurrent.futures import ThreadPoolExecutor
 
 from wiz import PORT, Wiz
 
-AP_IP_DEFAULT = "192.168.4.1"  # ESP8266/ESP32 soft-AP default
+AP_IP_CANDIDATES = ["192.168.56.1", "192.168.4.1"]
+# Observed WiZ AP IP (client gateway on the WiZConfig_* network) first,
+# then the generic ESP soft-AP default.
+AP_IP_DEFAULT = "auto"
+
+# Ports probed by `diag`: the known Wiz LAN ports first, then other
+# suspects, in case the AP-mode firmware listens elsewhere.
+AP_PORTS = [38899, 38900, 3889, 8909, 56700, 4444, 80, 55443]
 
 
 def _mask_secret(params):
     return {k: ("***" if k in ("password", "psk") else v) for k, v in params.items()}
 
 
+def _find_ap(args, port):
+    """Return (ip, cfg) of a reachable bulb on a known AP network, else (None, None)."""
+    candidates = AP_IP_CANDIDATES if args.ap_ip == "auto" else [args.ap_ip]
+    for ip in candidates:
+        probe = Wiz(ip, port=port, timeout=2)
+        try:
+            return ip, probe.info()
+        except (RuntimeError, OSError):
+            pass
+        finally:
+            probe.close()
+    return None, None
+
+
 def cmd_send(args):
     """Send home Wi-Fi credentials to a bulb sitting in AP mode."""
-    lamp = Wiz(args.ap_ip, timeout=5)
+    ip, cfg = _find_ap(args, args.port)
+    if ip is None:
+        tried = ", ".join(AP_IP_CANDIDATES) if args.ap_ip == "auto" else args.ap_ip
+        print(f"cannot reach a bulb on the AP (tried: {tried} port {args.port})", file=sys.stderr)
+        print("hint: is the Windows host still connected to the bulb's WiZConfig_* Wi-Fi?", file=sys.stderr)
+        print("      if ping 192.168.56.1 works but this stays silent, the AP-mode", file=sys.stderr)
+        print("      server is elsewhere: run  python3 ap-sweep.py  (full sweep + mDNS)", file=sys.stderr)
+        return 1
+    print(f"bulb on AP at {ip}:{args.port}: mac={cfg['mac']} model={cfg.get('moduleName')} fw={cfg.get('fwVersion')}")
+    lamp = Wiz(ip, port=args.port, timeout=5)
     try:
-        try:
-            cfg = lamp.info()
-        except (RuntimeError, OSError) as e:
-            print(f"cannot reach a bulb at {args.ap_ip}:{PORT} ({e})", file=sys.stderr)
-            print("hint: is this machine connected to the bulb's WiZConfig_* Wi-Fi?", file=sys.stderr)
-            return 1
         mac = cfg["mac"]
-        print(f"bulb on hotspot: mac={mac} model={cfg.get('moduleName')} fw={cfg.get('fwVersion')}")
 
         if args.raw_params:
             variants = [json.loads(args.raw_params)]
@@ -91,6 +120,38 @@ def cmd_send(args):
         return 1
     finally:
         lamp.close()
+
+
+def cmd_diag(args):
+    """One-shot evidence collector for an AP pairing window (run while the
+    host is connected to WiZConfig_*): probes candidate AP IPs x ports
+    with a getSystemConfig payload and reports every response."""
+    ips = AP_IP_CANDIDATES if args.ap_ip == "auto" else [args.ap_ip]
+    payload = json.dumps({"method": "getSystemConfig", "params": {}, "id": 1}).encode()
+    print(f"probing {len(ips)} ip(s) x {len(AP_PORTS)} ports "
+          f"({len(ips) * len(AP_PORTS) * 1.2:.0f}s worst case) ...")
+    found = []
+    for ip in ips:
+        for port in AP_PORTS:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(1.2)
+            s.sendto(payload, (ip, port))
+            try:
+                raw, _ = s.recvfrom(4096)
+                print(f"RESPONSE {ip}:{port} <- {raw.decode('utf-8', 'replace')[:200]}")
+                found.append((ip, port))
+            except (BlockingIOError, TimeoutError):
+                pass
+            finally:
+                s.close()
+    if found:
+        print(f"\nreachable: {found}")
+        print(f"next: python3 pair.py send <ssid> <password> --ap-ip {found[0][0]}")
+        return 0
+    print("\nno UDP responses on any candidate port.")
+    print("next: run  python3 ap-sweep.py  (full 1-65535 sweep + mDNS browse)")
+    print("to see whether the AP answers anything at all, and on which port.")
+    return 1
 
 
 def cmd_find(args):
@@ -175,7 +236,9 @@ def main():
     s.add_argument("ssid", help="home 2.4 GHz Wi-Fi SSID")
     s.add_argument("password", help="home Wi-Fi password")
     s.add_argument("--ap-ip", default=AP_IP_DEFAULT,
-                   help=f"bulb's hotspot IP (default {AP_IP_DEFAULT})")
+                   help="bulb's hotspot IP, or 'auto' to probe "
+                        + "/".join(AP_IP_CANDIDATES) + " (default auto)")
+    s.add_argument("--port", type=int, default=PORT, help=f"bulb's UDP port (default {PORT})")
     s.add_argument("--raw-params", help="raw JSON params to try instead of the built-in variants")
     s.set_defaults(func=cmd_send)
 
@@ -187,6 +250,11 @@ def main():
     c.add_argument("range", metavar="RANGE",
                    help="CIDR (192.168.0.0/24), a.b.c.d-e (192.168.0.100-150) or a single IP")
     c.set_defaults(func=cmd_scan)
+
+    d = sub.add_parser("diag", help="one-shot AP diagnostics: probe AP IPs x ports (run while on WiZConfig_*)")
+    d.add_argument("--ap-ip", default=AP_IP_DEFAULT,
+                   help="AP IP to probe, or 'auto' for the known candidates (default auto)")
+    d.set_defaults(func=cmd_diag)
 
     args = ap.parse_args()
     sys.exit(args.func(args) or 0)
